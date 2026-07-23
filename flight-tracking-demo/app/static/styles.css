@@ -556,6 +556,15 @@ body.rail-resizing .map { pointer-events: none; }
   margin-top: 4px;
   color: #e6b667;
 }
+.fs-note .fs-fallback {
+  display: block;
+  margin: 0 0 6px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  color: #ffd27a;
+  background: rgba(255, 190, 90, 0.10);
+  border: 1px solid rgba(255, 190, 90, 0.34);
+}
 
 /* ── Airspace section: divider + swatches + legend ─────────────────────── */
 

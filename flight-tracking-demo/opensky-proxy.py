@@ -146,6 +146,13 @@ CAPABILITIES = {
 
 USER_AGENT = "FlightOps-NemoClaw-demo/1.0 (+https://github.com/brevdev/nemoclaw-demos)"
 
+# Negative cache: once OpenSky is found unreachable (blackholed cloud IP),
+# skip the slow probe on subsequent polls and serve community directly for
+# this many seconds. Keeps opensky-mode refreshes snappy after the first
+# fallback instead of eating a ~14s timeout every cycle.
+_OPENSKY_DOWN_SECS = 120.0
+_opensky_down_until = 0.0
+
 # Unit conversions to OpenSky's SI state vector.
 _FT_TO_M = 0.3048
 _KT_TO_MS = 0.514444
@@ -405,11 +412,27 @@ def _effective_source(qs: dict[str, list[str]]) -> tuple[str, list[str]]:
 
 
 def _serve_states_community(
-    handler: "Handler", qs: dict[str, list[str]], providers: list[str]
+    handler: "Handler",
+    qs: dict[str, list[str]],
+    providers: list[str],
+    requested: str = "community",
+    fallback: bool = False,
 ) -> None:
-    """Answer /api/states/all from the community aggregators."""
+    """Answer /api/states/all from the community aggregators.
+
+    `requested` is the source the caller asked for (e.g. "opensky" when we
+    are here because OpenSky was unreachable and we fell back). `fallback`
+    marks that this community answer is standing in for a failed OpenSky
+    request, so the app/UI can say "OpenSky unavailable — community feed".
+    """
     lat, lon, nm = _bbox_to_circle(qs)
     now = time.time()
+
+    meta_headers = {
+        "X-Flightops-Source": "community",
+        "X-Flightops-Requested": requested,
+        "X-Flightops-Fallback": "1" if fallback else "0",
+    }
 
     last_err: Exception | None = None
     for name in providers:
@@ -429,15 +452,59 @@ def _serve_states_community(
                     states.append(row)
         sys.stderr.write(
             f"[opensky-proxy] states via {name}: {len(states)} aircraft "
-            f"({lat:.2f},{lon:.2f} r={nm}nm)\n"
+            f"({lat:.2f},{lon:.2f} r={nm}nm)"
+            f"{' [opensky-fallback]' if fallback else ''}\n"
         )
-        _send_json(handler, 200, {"time": int(now), "states": states})
+        _send_json(
+            handler, 200,
+            {
+                "time": int(now), "states": states,
+                "source": "community", "requested": requested,
+                "fallback": bool(fallback), "provider": name,
+            },
+            extra_headers={**meta_headers, "X-Flightops-Provider": name},
+        )
         return
 
     _send_json(
         handler, 502,
-        {"error": f"all ADS-B providers failed; last error: {last_err}", "states": []},
+        {
+            "error": f"all ADS-B providers failed; last error: {last_err}",
+            "states": [], "source": "community", "requested": requested,
+            "fallback": bool(fallback),
+        },
+        extra_headers=meta_headers,
     )
+
+
+def _fetch_opensky_states(query: str) -> tuple[dict | None, str]:
+    """Fetch /api/states/all from OpenSky. Returns (payload, err_message).
+
+    On success payload is the parsed JSON dict; on any failure it is None and
+    err_message explains why (used to trigger the community fallback). A short
+    timeout is used deliberately so a blackholed cloud IP falls back fast
+    rather than leaving the map blank for many seconds.
+    """
+    target = ROUTES["/api/states/all"]
+    url = f"{target}?{query}" if query else target
+    for attempt in (1, 2):
+        token = _tokens.get()
+        headers = {"Accept": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(url, method="GET", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                return (json.loads(resp.read().decode("utf-8")), "")
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and attempt == 1 and token:
+                _tokens.invalidate()
+                continue
+            return (None, f"opensky HTTP {e.code} {e.reason}")
+        except (urllib.error.URLError, OSError, json.JSONDecodeError,
+                ValueError) as e:
+            return (None, f"opensky unreachable: {e}")
+    return (None, "opensky retries exhausted")
 
 
 # ── HTTP helpers ────────────────────────────────────────────────────────────
@@ -454,11 +521,18 @@ def _resolve_target(path: str) -> str | None:
     return target
 
 
-def _send_json(handler: http.server.BaseHTTPRequestHandler, code: int, obj: dict) -> None:
+def _send_json(
+    handler: http.server.BaseHTTPRequestHandler,
+    code: int,
+    obj: dict,
+    extra_headers: dict[str, str] | None = None,
+) -> None:
     body = json.dumps(obj).encode()
     handler.send_response(code)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
+    for k, v in (extra_headers or {}).items():
+        handler.send_header(k, v)
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -536,7 +610,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if parsed.path == "/api/states/all":
             if eff_mode == "opensky":
-                self._passthrough_or_404("/api/states/all", parsed.query)
+                global _opensky_down_until
+                now = time.time()
+                # Skip the slow OpenSky probe if we recently found it down.
+                if now < _opensky_down_until:
+                    _serve_states_community(
+                        self, qs, list(_ALL_PROVIDERS),
+                        requested="opensky", fallback=True,
+                    )
+                    return
+                data, err = _fetch_opensky_states(parsed.query)
+                if data is not None:
+                    _opensky_down_until = 0.0
+                    data.setdefault("source", "opensky")
+                    data.setdefault("requested", "opensky")
+                    data.setdefault("fallback", False)
+                    _send_json(self, 200, data, extra_headers={
+                        "X-Flightops-Source": "opensky",
+                        "X-Flightops-Requested": "opensky",
+                        "X-Flightops-Fallback": "0",
+                    })
+                    return
+                # OpenSky failed/blackholed — remember it (negative cache) and
+                # fall back to community so the map keeps showing planes.
+                _opensky_down_until = now + _OPENSKY_DOWN_SECS
+                sys.stderr.write(
+                    f"[opensky-proxy] opensky states failed ({err}); serving "
+                    f"community for {int(_OPENSKY_DOWN_SECS)}s\n"
+                )
+                _serve_states_community(
+                    self, qs, list(_ALL_PROVIDERS),
+                    requested="opensky", fallback=True,
+                )
             else:
                 _serve_states_community(self, qs, eff_providers)
             return
