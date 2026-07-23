@@ -1462,6 +1462,14 @@ body.rail-resizing .map { pointer-events: none; }
   border-style: dashed;
 }
 
+/* Live elapsed counter shown next to the "Agent working…" label so a
+   long, silent model turn visibly ticks instead of looking frozen. */
+.working-elapsed {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.6;
+  font-size: 0.9em;
+}
+
 .thinking-dots {
   display: inline-flex; gap: 3px;
 }

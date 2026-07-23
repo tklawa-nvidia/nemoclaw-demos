@@ -82,6 +82,24 @@ ROUTES = {
 
 # ── Data-source configuration ───────────────────────────────────────────────
 
+# Optional outbound proxy for OpenSky ONLY. OpenSky blackholes cloud/
+# datacenter IP ranges (AWS/GCP/Azure) at the TCP layer — the SYN is
+# dropped *before* TLS, so the connection never opens and OpenSky never
+# sees your OAuth2 credentials. No amount of authentication fixes that:
+# the block is on the source IP, applied pre-auth. The only way to reach
+# OpenSky from a cloud VM is to egress through a NON-datacenter hop.
+#
+# Set OPENSKY_EGRESS_PROXY to route just the OpenSky token-mint + API
+# calls (NOT the community feeds, which work fine directly) through such
+# a hop while keeping the credentials on the host. Examples:
+#     http://127.0.0.1:8080        (Squid/tinyproxy/Cloudflare-WARP-proxy)
+#     http://user:pass@host:port   (authenticated forward proxy)
+#     socks5h://127.0.0.1:1080     (e.g. `ssh -D 1080 you@home-box`; needs PySocks)
+# For socks5h:// the DNS is resolved at the proxy exit (recommended so
+# opensky-network.org resolves from the non-cloud side). Leave unset to
+# hit OpenSky directly (the default, correct for non-cloud hosts).
+EGRESS_PROXY = os.getenv("OPENSKY_EGRESS_PROXY", "").strip()
+
 RAW_SOURCE = (os.getenv("FLIGHT_ADSB_SOURCE", "community") or "community").strip().lower()
 MAX_RADIUS_NM = float(os.getenv("FLIGHT_ADSB_MAX_NM", "250") or "250")
 DEFAULT_LAT = float(os.getenv("FLIGHT_ADSB_DEFAULT_LAT", "39.5") or "39.5")
@@ -240,7 +258,7 @@ class TokenCache:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with _OPENSKY_OPENER.open(req, timeout=8) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             sys.stderr.write(
@@ -494,7 +512,7 @@ def _fetch_opensky_states(query: str) -> tuple[dict | None, str]:
             headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(url, method="GET", headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=6) as resp:
+            with _OPENSKY_OPENER.open(req, timeout=6) as resp:
                 return (json.loads(resp.read().decode("utf-8")), "")
         except urllib.error.HTTPError as e:
             if e.code == 401 and attempt == 1 and token:
@@ -508,6 +526,53 @@ def _fetch_opensky_states(query: str) -> tuple[dict | None, str]:
 
 
 # ── HTTP helpers ────────────────────────────────────────────────────────────
+
+
+def _build_opener() -> urllib.request.OpenerDirector:
+    """Build the urllib opener used for OpenSky calls.
+
+    Without OPENSKY_EGRESS_PROXY this is a plain opener (direct egress).
+    With it, all OpenSky traffic is routed through the configured proxy so
+    a cloud VM can reach OpenSky via a non-datacenter hop. http(s):// proxies
+    need no extra dependencies; socks5(h):// requires PySocks (`pip install
+    PySocks`) and degrades gracefully to direct (→ community fallback) if it
+    isn't installed, with a one-line warning.
+    """
+    if not EGRESS_PROXY:
+        return urllib.request.build_opener()
+    if EGRESS_PROXY.lower().startswith("socks"):
+        try:
+            import socks  # type: ignore  # from PySocks
+            from sockshandler import SocksiPyHandler  # type: ignore
+        except ImportError:
+            sys.stderr.write(
+                "[opensky-proxy] OPENSKY_EGRESS_PROXY is a SOCKS URL but "
+                "PySocks is not installed (`pip install PySocks`); falling "
+                "back to DIRECT egress — OpenSky will likely be unreachable "
+                "and community fallback will serve instead.\n"
+            )
+            return urllib.request.build_opener()
+        parsed = urllib.parse.urlparse(EGRESS_PROXY)
+        # socks5h:// → resolve DNS at the proxy exit (rdns=True); socks5:// → local.
+        rdns = parsed.scheme.lower() in ("socks5h", "socks4a")
+        stype = socks.SOCKS4 if parsed.scheme.lower().startswith("socks4") else socks.SOCKS5
+        return urllib.request.build_opener(
+            SocksiPyHandler(
+                stype, parsed.hostname, parsed.port or 1080, rdns,
+                parsed.username, parsed.password,
+            )
+        )
+    # http:// or https:// forward proxy (CONNECT tunnelling for https targets).
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": EGRESS_PROXY, "https": EGRESS_PROXY})
+    )
+
+
+# Built once at import; OpenSky call sites use this instead of the module-level
+# urllib.request.urlopen so the egress proxy (if any) is applied. Community
+# aggregator calls deliberately keep using plain urlopen — they work directly
+# and there's no reason to tunnel them.
+_OPENSKY_OPENER = _build_opener()
 
 
 def _resolve_target(path: str) -> str | None:
@@ -550,7 +615,7 @@ def _passthrough(
 
         req = urllib.request.Request(target, method="GET", headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with _OPENSKY_OPENER.open(req, timeout=8) as resp:
                 body = resp.read()
                 handler.send_response(resp.status)
                 ct = resp.headers.get("Content-Type", "application/json")
@@ -601,6 +666,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "routes": list(ROUTES.keys()),
                 "creds_loaded": bool(cid and secret),
                 "creds_path": CREDS_PATH,
+                "egress_proxy": EGRESS_PROXY or None,
             })
             return
 
@@ -715,6 +781,18 @@ def main() -> None:
             sys.stderr.write(
                 f"[opensky-proxy] WARNING: no OPENSKY_CLIENT_ID/SECRET in "
                 f"{CREDS_PATH}; running anonymously (~400 credits/day)\n"
+            )
+        if EGRESS_PROXY:
+            sys.stderr.write(
+                f"[opensky-proxy] OpenSky egress via proxy: {EGRESS_PROXY}\n"
+            )
+        else:
+            sys.stderr.write(
+                "[opensky-proxy] NOTE: no OPENSKY_EGRESS_PROXY set. If this "
+                "host is a cloud/datacenter VM, OpenSky blocks its IP at the "
+                "TCP layer (pre-auth) and every request will time out and fall "
+                "back to community. Set OPENSKY_EGRESS_PROXY to a non-datacenter "
+                "hop, or use FLIGHT_ADSB_SOURCE=community.\n"
             )
         sys.stderr.write(
             f"[opensky-proxy] listening on 0.0.0.0:{port} "
