@@ -58,12 +58,30 @@ INSTALL_DIR="$HOME/.nemoclaw/flight-tracking"
 PORT="${FLIGHT_APP_PORT:-18890}"
 OPENSKY_PROXY_PORT="${OPENSKY_PROXY_PORT:-9202}"
 FAA_PROXY_PORT="${FAA_PROXY_PORT:-9203}"
+# Live-aircraft data source for the host proxy:
+#   "community" (default) — free, no-auth ADS-B aggregators (adsb.fi /
+#     airplanes.live / adsb.lol). These are reachable from cloud/VM IPs.
+#     OpenSky blackholes datacenter IP ranges (AWS/GCP/Azure), so from a
+#     brev VM opensky-network.org is unreachable — hence community is the
+#     default so planes show out of the box.
+#   "opensky" — legacy OAuth2 path to opensky-network.org (needs creds and
+#     an egress IP OpenSky accepts; use only on non-cloud hosts).
+FLIGHT_ADSB_SOURCE="${FLIGHT_ADSB_SOURCE:-community}"
 # Gateway name registered with `nemoclaw onboard`. "nemoclaw" is the
 # convention; override via OPENSHELL_GATEWAY=<name> if you renamed it.
 GATEWAY_NAME="${OPENSHELL_GATEWAY:-nemoclaw}"
 # Skip the systemd-user tunnel install (e.g. on macOS hosts that don't
 # have systemd-user — the script will fall back to `openshell forward`).
 SKIP_SYSTEMD_TUNNEL="${SKIP_SYSTEMD_TUNNEL:-0}"
+# Optional public "Brev link" forward: a second, reboot-persistent
+# systemd-user unit that binds 0.0.0.0:$BREV_FORWARD_PORT -> sandbox app,
+# so Brev can publish the console as a secure link
+# (*.apps.run.brev.nvidia.com). Off by default because 0.0.0.0 exposes
+# the app on the VM's network; enable with --brev-link (optionally
+# --brev-link <port>) or ENABLE_BREV_FORWARD=1. The loopback
+# flight-tunnel.service (localhost) is always installed regardless.
+ENABLE_BREV_FORWARD="${ENABLE_BREV_FORWARD:-0}"
+BREV_FORWARD_PORT="${BREV_FORWARD_PORT:-18891}"
 
 CREDS_PATH="$HOME/.nemoclaw/credentials.json"
 
@@ -122,6 +140,9 @@ usage_exit() {
     --uninstall            Remove sandbox-side install, stop proxies + tunnel
     --update-creds         Force-prompt for new OpenSky OAuth2 credentials
     --skip-systemd         Don't touch the systemd-user tunnel
+    --brev-link [<port>]   Also install a reboot-persistent 0.0.0.0 forward
+                           (default port 18891) so Brev can publish a secure
+                           link. Loopback/localhost access is unaffected.
     --port <N>             FastAPI port (default 18890)
     --opensky-port <N>     opensky-proxy port (default 9202)
     --faa-port <N>         faa-proxy port (default 9203)
@@ -134,6 +155,9 @@ usage_exit() {
     OPENSKY_PROXY_HOST     Override auto-detected host IP for sandbox→host bridge
     FLIGHT_APP_PORT        FastAPI port (default 18890)
     SKIP_SYSTEMD_TUNNEL    Set to 1 to skip systemd-user tunnel install
+    FLIGHT_ADSB_SOURCE     Live-aircraft source: community (default) | opensky
+    ENABLE_BREV_FORWARD    Set to 1 to install the public 0.0.0.0 Brev forward
+    BREV_FORWARD_PORT      Public port for the Brev forward (default 18891)
 
 EOF
   exit 0
@@ -151,6 +175,15 @@ while [ $# -gt 0 ]; do
     --uninstall)     DO_UNINSTALL=true;     shift ;;
     --update-creds)  FORCE_UPDATE_CREDS=true; shift ;;
     --skip-systemd)  SKIP_SYSTEMD_TUNNEL=1; shift ;;
+    --brev-link)
+      ENABLE_BREV_FORWARD=1
+      # Optional numeric port may follow (e.g. --brev-link 18895).
+      case "${2:-}" in
+        ''|--*) ;;
+        *[!0-9]*) fail "--brev-link port must be numeric: $2" ;;
+        *) BREV_FORWARD_PORT="$2"; shift ;;
+      esac
+      shift ;;
     --port)          PORT="${2:?--port needs a value}"; shift 2 ;;
     --opensky-port)  OPENSKY_PROXY_PORT="${2:?--opensky-port needs a value}"; shift 2 ;;
     --faa-port)      FAA_PROXY_PORT="${2:?--faa-port needs a value}"; shift 2 ;;
@@ -292,6 +325,7 @@ if [ "$DO_STATUS" = true ]; then
     echo "    Host IP:        ${FLIGHT_HOST_IP:-unknown}"
     echo "    App port:       ${FLIGHT_PORT:-unknown}"
     echo "    OpenSky proxy:  ${FLIGHT_OPENSKY_PROXY_PORT:-unknown}"
+    echo "    Live data src:  ${FLIGHT_ADSB_SOURCE:-community}"
     echo "    FAA proxy:      ${FLIGHT_FAA_PROXY_PORT:-unknown}"
     echo "    Installed at:   ${FLIGHT_INSTALLED_AT:-unknown}"
   else
@@ -315,7 +349,9 @@ if [ "$DO_STATUS" = true ]; then
     warn "faa-proxy /health failed"
   fi
   echo
-  if [ -f "$CREDS_PATH" ]; then
+  if [ "${FLIGHT_ADSB_SOURCE:-community}" = "community" ]; then
+    ok "Live data via community ADS-B feeds — no OpenSky credentials required"
+  elif [ -f "$CREDS_PATH" ]; then
     HAS=$(python3 -c "import json; d=json.load(open('$CREDS_PATH')); print('yes' if (d.get('OPENSKY_CLIENT_ID') and d.get('OPENSKY_CLIENT_SECRET')) else 'no')" 2>/dev/null || echo no)
     [ "$HAS" = "yes" ] && ok "OPENSKY_CLIENT_ID/SECRET present in $CREDS_PATH" \
                        || warn "OPENSKY OAuth2 creds missing from $CREDS_PATH (anonymous fallback)"
@@ -328,9 +364,19 @@ if [ "$DO_STATUS" = true ]; then
      systemctl --user list-unit-files flight-tunnel.service 2>/dev/null \
        | grep -q '^flight-tunnel.service'; then
     if systemctl --user is-active --quiet flight-tunnel.service 2>/dev/null; then
-      ok "flight-tunnel.service active (port forward up)"
+      ok "flight-tunnel.service active (loopback forward up)"
     else
       warn "flight-tunnel.service installed but NOT active"
+    fi
+  fi
+  # Public Brev forward state (only if it was installed).
+  if command -v systemctl >/dev/null 2>&1 && \
+     systemctl --user list-unit-files flight-brev-forward.service 2>/dev/null \
+       | grep -q '^flight-brev-forward.service'; then
+    if systemctl --user is-active --quiet flight-brev-forward.service 2>/dev/null; then
+      ok "flight-brev-forward.service active (0.0.0.0:${FLIGHT_BREV_FORWARD_PORT:-18891} — Brev secure link)"
+    else
+      warn "flight-brev-forward.service installed but NOT active"
     fi
   fi
   # Browser-reachable backend?
@@ -365,7 +411,25 @@ if [ "$DO_UNINSTALL" = true ]; then
     systemctl --user daemon-reload 2>/dev/null || true
     ok "Tunnel unit removed"
   fi
+  # Public Brev forward unit (if it was installed).
+  if command -v systemctl >/dev/null 2>&1 && \
+     systemctl --user list-unit-files flight-brev-forward.service 2>/dev/null \
+       | grep -q '^flight-brev-forward.service'; then
+    info "Stopping flight-brev-forward.service…"
+    systemctl --user stop flight-brev-forward.service 2>/dev/null || true
+    systemctl --user disable flight-brev-forward.service 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/flight-brev-forward.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    ok "Brev forward unit removed"
+  fi
   openshell forward stop "$PORT" >/dev/null 2>&1 || true
+  # Best-effort: stop any non-persistent Brev forward fallback too.
+  if [ -f "$INSTALL_DIR/config.env" ]; then
+    # shellcheck disable=SC1091
+    . "$INSTALL_DIR/config.env" 2>/dev/null || true
+    [ -n "${FLIGHT_BREV_FORWARD_PORT:-}" ] && \
+      openshell forward stop "$FLIGHT_BREV_FORWARD_PORT" >/dev/null 2>&1 || true
+  fi
 
   # 2. Stop both host-side proxies.
   for pat in "python3.*opensky-proxy\.py" "python3.*faa-proxy\.py"; do
@@ -522,7 +586,15 @@ prompt_for_creds() {
   fi
 }
 
-if [ -n "$OPENSKY_CLIENT_ID" ] && [ -n "$OPENSKY_CLIENT_SECRET" ]; then
+if [ "$FLIGHT_ADSB_SOURCE" = "community" ]; then
+  echo
+  ok "Live-aircraft data source: community ADS-B feeds (adsb.fi / airplanes.live / adsb.lol)"
+  info "No OpenSky account or credentials are required in community mode."
+  info "These feeds are reachable from cloud/VM IPs, unlike opensky-network.org."
+  info "To use OpenSky instead, re-run with FLIGHT_ADSB_SOURCE=opensky (non-cloud hosts only)."
+  # Not used in community mode; leave any existing credentials.json untouched.
+  OPENSKY_CLIENT_ID=""; OPENSKY_CLIENT_SECRET=""
+elif [ -n "$OPENSKY_CLIENT_ID" ] && [ -n "$OPENSKY_CLIENT_SECRET" ]; then
   echo
   ok "OpenSky credentials found in $CREDS_PATH"
   printf "    OPENSKY_CLIENT_ID     = %s\n" "$(mask "$OPENSKY_CLIENT_ID")"
@@ -638,7 +710,7 @@ fi
 #   * a new code revision of opensky-proxy.py is picked up
 #   * we reset any stuck state from a previous run
 echo
-info "Starting host-side opensky-proxy on 0.0.0.0:$OPENSKY_PROXY_PORT…"
+info "Starting host-side opensky-proxy on 0.0.0.0:$OPENSKY_PROXY_PORT (data source: $FLIGHT_ADSB_SOURCE)…"
 
 # Best-effort kill of any prior copy of the daemon. Match the python
 # command line rather than relying on a pidfile so a stale pidfile from
@@ -655,7 +727,8 @@ fi
 # `setsid nohup` so the daemon survives the install.sh shell exit and
 # so it gets its own session (won't be orphaned to the systemd reaper).
 mkdir -p "$(dirname /tmp/opensky-proxy.log)" 2>/dev/null || true
-setsid nohup python3 "$SCRIPT_DIR/opensky-proxy.py" \
+setsid nohup env "FLIGHT_ADSB_SOURCE=$FLIGHT_ADSB_SOURCE" \
+    python3 "$SCRIPT_DIR/opensky-proxy.py" \
     --port "$OPENSKY_PROXY_PORT" \
     > /tmp/opensky-proxy.log 2>&1 < /dev/null &
 PROXY_PID=$!
@@ -1048,6 +1121,19 @@ else
   systemctl --user enable flight-tunnel.service >/dev/null 2>&1 \
     && ok "Tunnel unit enabled (sandbox=$SANDBOX_NAME, gateway=$GATEWAY_NAME, port=$PORT)" \
     || warn "Could not enable flight-tunnel.service — falling back to \`openshell forward\`."
+  # Enable linger so the user manager (and thus these forwards) starts at
+  # boot on headless VMs where nobody logs in interactively. Best-effort:
+  # try unprivileged first, then sudo -n; a failure only means the unit
+  # won't auto-start until the next login.
+  if [ "$(loginctl show-user "$(id -un)" --property=Linger --value 2>/dev/null)" != "yes" ]; then
+    if loginctl enable-linger "$(id -un)" >/dev/null 2>&1 \
+       || sudo -n loginctl enable-linger "$(id -un)" >/dev/null 2>&1; then
+      ok "Enabled systemd linger (forwards start on reboot)"
+    else
+      warn "Could not enable systemd linger — forwards may not start until next login."
+      warn "  Fix with: sudo loginctl enable-linger $(id -un)"
+    fi
+  fi
 fi
 
 # ── 10. Host-side port forward ──────────────────────────────────────────
@@ -1094,6 +1180,75 @@ if ! $forward_ok; then
   warn "  openshell forward stop $PORT && openshell forward start $PORT $SANDBOX_NAME -d"
 fi
 
+# ── 10b. Optional public Brev forward (0.0.0.0, reboot-persistent) ───────
+# A SECOND forward, bound to all interfaces, so Brev can publish the
+# console as a secure link. Kept separate from the loopback tunnel above
+# so local/Cursor access (127.0.0.1:$PORT) is never disturbed.
+BREV_FORWARD_TEMPLATE="$SCRIPT_DIR/scripts/systemd/flight-brev-forward.service.template"
+BREV_FORWARD_UNIT="$TUNNEL_UNIT_DIR/flight-brev-forward.service"
+if [ "$ENABLE_BREV_FORWARD" = "1" ]; then
+  echo
+  if [ "$BREV_FORWARD_PORT" = "$PORT" ]; then
+    warn "--brev-link port ($BREV_FORWARD_PORT) must differ from the app port ($PORT); skipping Brev forward."
+  else
+    info "Installing public Brev forward on 0.0.0.0:$BREV_FORWARD_PORT -> sandbox app ($PORT)…"
+    brev_ok=false
+    if systemd_user_available && [ -f "$BREV_FORWARD_TEMPLATE" ]; then
+      mkdir -p "$TUNNEL_UNIT_DIR"
+      TMP_BUNIT=$(mktemp)
+      sed -e "s|__SANDBOX_NAME__|$SANDBOX_NAME|g" \
+          -e "s|__GATEWAY_NAME__|$GATEWAY_NAME|g" \
+          -e "s|__APP_PORT__|$PORT|g" \
+          -e "s|__BREV_PORT__|$BREV_FORWARD_PORT|g" \
+          -e "s|__HOME__|$HOME|g" \
+          "$BREV_FORWARD_TEMPLATE" > "$TMP_BUNIT"
+      if [ ! -f "$BREV_FORWARD_UNIT" ] || ! cmp -s "$TMP_BUNIT" "$BREV_FORWARD_UNIT"; then
+        mv "$TMP_BUNIT" "$BREV_FORWARD_UNIT"
+        systemctl --user daemon-reload 2>/dev/null \
+          && ok "Wrote $BREV_FORWARD_UNIT" \
+          || warn "daemon-reload failed; unit written but not loaded"
+      else
+        rm -f "$TMP_BUNIT"
+        ok "Brev forward unit already up to date"
+      fi
+      systemctl --user enable flight-brev-forward.service >/dev/null 2>&1 \
+        && ok "Brev forward unit enabled (survives reboot)" \
+        || warn "Could not enable flight-brev-forward.service"
+      systemctl --user restart flight-brev-forward.service >/dev/null 2>&1 || true
+      for _ in 1 2 3 4 5; do
+        sleep 1
+        if curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$BREV_FORWARD_PORT/api/health"; then
+          brev_ok=true; break
+        fi
+      done
+    else
+      warn "systemd-user not available or template missing — using non-persistent \`openshell forward\` fallback."
+      $OPENSHELL_BIN forward stop "$BREV_FORWARD_PORT" >/dev/null 2>&1 || true
+      setsid nohup "$OPENSHELL_BIN" forward service --target-port "$PORT" \
+          --local "0.0.0.0:$BREV_FORWARD_PORT" "$SANDBOX_NAME" \
+          > /tmp/flight-brev-forward.log 2>&1 < /dev/null &
+      disown 2>/dev/null || true
+      for _ in 1 2 3 4 5; do
+        sleep 1
+        if curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$BREV_FORWARD_PORT/api/health"; then
+          brev_ok=true; break
+        fi
+      done
+    fi
+    if $brev_ok; then
+      ok "Public Brev forward active on 0.0.0.0:$BREV_FORWARD_PORT"
+      info "Publish port $BREV_FORWARD_PORT in the Brev console for a secure *.apps.run.brev.nvidia.com link."
+    else
+      warn "Brev forward not reachable on 0.0.0.0:$BREV_FORWARD_PORT — inspect:"
+      warn "  systemctl --user status flight-brev-forward.service"
+      warn "  (or /tmp/flight-brev-forward.log if using the fallback)"
+    fi
+  fi
+else
+  info "Public Brev forward disabled. Enable a reboot-persistent secure-link forward with:"
+  info "  ./install.sh $SANDBOX_NAME --brev-link            # default port 18891"
+fi
+
 # ── 11. Refresh agent sessions so the skill is picked up ────────────────
 # Layout-aware: clear whichever sessions.json the agent home actually
 # carries. No-op on a fresh install (file doesn't exist yet).
@@ -1114,6 +1269,9 @@ FLIGHT_OPENCLAW_JSON=$OPENCLAW_JSON
 FLIGHT_HOST_IP=$HOST_IP
 FLIGHT_PORT=$PORT
 FLIGHT_OPENSKY_PROXY_PORT=$OPENSKY_PROXY_PORT
+FLIGHT_ADSB_SOURCE=$FLIGHT_ADSB_SOURCE
+FLIGHT_ENABLE_BREV_FORWARD=$ENABLE_BREV_FORWARD
+FLIGHT_BREV_FORWARD_PORT=$BREV_FORWARD_PORT
 FLIGHT_FAA_PROXY_PORT=$FAA_PROXY_PORT
 FLIGHT_OPENSHELL_BIN=$OPENSHELL_BIN
 FLIGHT_INSTALLED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -1148,6 +1306,7 @@ cat <<EOF
   Skill:       $SKILLS_BASE/flight-tracking
   Agent home:  $OPENCLAW_AGENT_HOME
   Layout:      $LAYOUT
+  Live data:   $FLIGHT_ADSB_SOURCE  (community = adsb.fi / airplanes.live / adsb.lol; no OpenSky creds needed)
   Helper:      \`fly\` CLI inside the sandbox (try: fly goto IAD)
 
   Secrets (Tier-1 host-proxy):
@@ -1168,3 +1327,16 @@ cat <<EOF
     "Any unusual squawks near LHR right now?"
 
 EOF
+
+if [ "$ENABLE_BREV_FORWARD" = "1" ] && [ "$BREV_FORWARD_PORT" != "$PORT" ]; then
+  cat <<EOF
+  Brev secure link:
+    Public forward: 0.0.0.0:$BREV_FORWARD_PORT -> sandbox app ($PORT), reboot-persistent
+    Unit:           systemctl --user status flight-brev-forward.service
+    Next step:      publish port $BREV_FORWARD_PORT in the Brev console to get a
+                    https://<name>.apps.run.brev.nvidia.com secure link.
+    Note:           0.0.0.0 exposes the app on the VM network; the app has no auth
+                    of its own — rely on Brev's secure link and remove with --uninstall.
+
+EOF
+fi

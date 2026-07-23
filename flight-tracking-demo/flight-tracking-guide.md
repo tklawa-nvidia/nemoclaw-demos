@@ -106,6 +106,56 @@ The agent uses **OpenClaw skills** (not MCP): `skills/flight-tracking/SKILL.md` 
 
 ---
 
+## Live-aircraft data source (choosing a feed)
+
+You can switch feeds two ways: **live, from the console UI** (no reinstall), or as the **install-time default**.
+
+**In the console (per viewer):** open the **Layers** panel — under the **Live aircraft** toggle there's a **Data feed** selector with a short note of what that feed supports (live tracking/trails always work; only OpenSky adds *pre-built* history, and only from a non-cloud host). Pick `Community · auto`, a single vendor, or `OpenSky`. The choice is remembered per browser and takes effect on the next poll. Under the hood the UI passes `?provider=…` to `/api/flights`, the sandbox forwards it to the proxy, and `GET /api/sources` supplies the option list + capability notes.
+
+**From chat (drives the map + the agent's own analysis):** the flight-tracking skill is provider-aware — just ask the OpenClaw/Nemoclaw agent to *"switch the live feed to airplanes.live"* (or `adsb.fi` / `adsb.lol` / `opensky` / `community`). It calls `POST /api/map/source`, which flips the feed for **both** the operator's map (all connected browsers update their selector + note) **and** every server-side read the agent uses (`/api/flights`, `/api/analyze`, `/api/flights/find`, `/api/map/track`) — so what the agent reasons about always matches what you see. The skill also knows the capability differences: on the default community feed it won't claim OpenSky-confirmed origins or offer pre-built per-aircraft history, and it falls back to the callsign route lookup (`/api/route`) for origin → destination.
+
+**At install time (default for everyone):** the host proxy (`opensky-proxy.py`) sources live aircraft from OpenSky **or** from free community ADS-B aggregators, selected with a single env var, `FLIGHT_ADSB_SOURCE`:
+
+| `FLIGHT_ADSB_SOURCE` | What it does |
+|---|---|
+| `community` (default) | Community aggregators with automatic fallback across `adsb.fi` → `airplanes.live` → `adsb.lol`. First to respond wins. |
+| `adsb.fi` / `airplanes.live` / `adsb.lol` | Pin to that **one** vendor (no fallback). |
+| `opensky` | Legacy OpenSky OAuth2 passthrough (needs credentials). |
+
+> **Why the default is `community`, not `opensky`:** OpenSky blackholes datacenter/cloud IP ranges (AWS/GCP/Azure). From a Brev/cloud VM, `opensky-network.org` is unreachable (the SYN is dropped inside OpenSky's network — confirmed via TCP traceroute), so planes never load. The community feeds have no such block and need no credentials, so they work out of the box on cloud VMs. Use `opensky` only on a non-cloud host whose egress OpenSky still accepts.
+
+Set it at install time, e.g.:
+
+```bash
+FLIGHT_ADSB_SOURCE=airplanes.live ./install.sh <sandbox-name>   # pin one vendor
+FLIGHT_ADSB_SOURCE=opensky        ./install.sh <sandbox-name>   # non-cloud hosts
+```
+
+Optional companions: `FLIGHT_ADSB_PROVIDERS` (comma list to reorder/limit the `community` fallback) and `FLIGHT_ADSB_MAX_NM` (max query radius, default 250 nm — the aggregators are radius-based, so very zoomed-out views are covered as a 250 nm circle around the viewport centre).
+
+Check what's live at any time — `GET /` on the proxy reports the mode, active providers, and capabilities:
+
+```bash
+curl -s http://127.0.0.1:9202/ | python3 -m json.tool
+```
+
+### What each feed supports
+
+| Capability | OpenSky | Community (adsb.fi / airplanes.live / adsb.lol) |
+|---|---|---|
+| Live positions (lat/lon, alt, speed, heading, v-rate, squawk) | ✅ | ✅ |
+| **Live tracking / follow a plane** (icon moves, camera follows) | ✅ | ✅ |
+| **Live trail** (drawn as you watch — client accumulates each poll) | ✅ | ✅ |
+| **Pre-built track history** (backfill of where a plane flew *before* you opened it) | ✅ | ❌ (no per-aircraft historical-track API) |
+| Origin → destination in the detail drawer | ✅ (icao24 flight history) | ✅ via callsign route lookup (`adsbdb`), ❌ the icao24 path |
+| Aircraft registry (registration, type, operator, photo) | n/a (uses `adsbdb`/`hexdb`) | ✅ (unchanged — `adsbdb`/`hexdb`, independent of the source) |
+| Needs credentials | ✅ OAuth2 | ❌ none |
+| Works from a cloud/VM IP | ❌ (blocks cloud ranges) | ✅ |
+
+**So does losing OpenSky history stop you from tracking flights? No.** You can still fully track any flight live — the plane renders, moves, you can select/follow/highlight it, colour by altitude/phase/squawk, and a trail builds up in real time as the app polls. The only things the community feeds don't provide are: (1) the *pre-built* track showing where a plane had already been before you started watching, and (2) OpenSky's icao24-keyed origin/destination — and even origin/destination is still filled in from the callsign route lookup (`adsbdb`). Registry/photo enrichment is unaffected because it never used OpenSky.
+
+---
+
 ## Usage Examples
 
 ### Map prompts (agent)
